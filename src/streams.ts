@@ -2,7 +2,7 @@
  * StreamsModule - all DripStream + DripFactory operations.
  */
 
-import { SorobanRpc, nativeToScVal, xdr, Address, Transaction, BASE_FEE } from '@stellar/stellar-sdk';
+import { SorobanRpc, nativeToScVal, xdr, Address, Transaction, BASE_FEE, Asset } from '@stellar/stellar-sdk';
 import type { Signer } from './signer.js';
 import type {
   ConduitConfig,
@@ -69,7 +69,7 @@ function warnV1Deprecated(methodName: string, replacement: string): void {
     `major version. Use ${replacement} instead.`,
   );
 }
-import { ZERO_ADDR } from './constants.js';
+import { ZERO_ADDR, DEFAULT_LIST_LIMIT, clampListLimit, USDC_ISSUER } from './constants.js';
 
 export class StreamsModule {
   private readonly rpcUrl:     string;
@@ -208,8 +208,25 @@ export class StreamsModule {
 
     const factoryId = this.config.factoryAddress ?? '';
 
+    
+    const now = Math.floor(Date.now() / 1000);
+    if (startTime !== undefined && startTime < now) {
+      throw new Error('Invalid startTime: cannot be in the past');
+    }
+
+    let resolvedToken = token;
+    if (token === 'native') {
+      resolvedToken = Asset.native().contractId(this.passphrase);
+    } else if (token === 'USDC') {
+      const issuer = this.passphrase.includes('Test SDF Network')
+        ? USDC_ISSUER.testnet
+        : USDC_ISSUER.mainnet;
+      resolvedToken = new Asset('USDC', issuer).contractId(this.passphrase);
+    }
+
     // Query token decimals
-    const decimals = await getTokenDecimals(this.rpcUrl, this.passphrase, senderAddr, token);
+    const decimals = await getTokenDecimals(this.rpcUrl, this.passphrase, senderAddr, resolvedToken);
+
 
     const depositStroops = toStroops(depositAmount, decimals);
     const rateStroops    = ratePerSecond
@@ -221,7 +238,7 @@ export class StreamsModule {
     const args = [
       new Address(senderAddr).toScVal(),
       new Address(recipient).toScVal(),
-      new Address(token).toScVal(),
+      new Address(resolvedToken).toScVal(),
       nativeToScVal(depositStroops, { type: 'i128' }),
       nativeToScVal(rateStroops,    { type: 'i128' }),
       nativeToScVal(start,          { type: 'u64'  }),
@@ -300,6 +317,15 @@ export class StreamsModule {
   async withdraw(streamId: bigint | string, amount?: bigint): Promise<string> {
     this._ensureCanMutate();
     const id  = BigInt(streamId);
+    // Fail fast on invalid amounts, the same way create() validates its
+    // payload client-side, instead of paying for a full simulate+reject
+    // cycle that surfaces StreamErrorCode.InvalidAmount from the contract.
+    // Only applies when the caller passes an explicit amount — omitting it
+    // (defaulting to the full withdrawable balance) is always valid, and a
+    // zero balance there correctly surfaces NothingToWithdraw instead.
+    if (amount !== undefined && amount <= 0n) {
+      throw new Error('Invalid amount: must be greater than zero');
+    }
     const qty = amount ?? await this.withdrawable(id);
     return this._invoke(await this._resolveAddr(id), 'withdraw', [
       nativeToScVal(qty, { type: 'i128' }),
@@ -359,6 +385,11 @@ export class StreamsModule {
   /** Deposit additional tokens into the stream (sender only). */
   async topUp(streamId: bigint | string, amount: bigint): Promise<string> {
     this._ensureCanMutate();
+    // Client-side guard mirroring the contract's StreamErrorCode.InvalidAmount
+    // so a zero/negative top-up fails fast instead of round-tripping.
+    if (amount <= 0n) {
+      throw new Error('Invalid amount: must be greater than zero');
+    }
     return this._invoke(await this._resolveAddr(BigInt(streamId)), 'top_up', [
       nativeToScVal(amount, { type: 'i128' }),
     ]);
@@ -367,6 +398,34 @@ export class StreamsModule {
   /** Top up a stream using string parameters (convenience wrapper). */
   async topUpStream(streamId: string, amount: string): Promise<string> {
     return this.topUp(streamId, BigInt(amount));
+  }
+
+  /**
+   * Force-cancel a paused stream as the recipient once the 30-day pause
+   * threshold has elapsed (recipient only). Settles atomically like
+   * cancel(): the recipient's earned-but-unwithdrawn tokens are paid out
+   * and the unstreamed remainder is refunded to the sender. Prevents a
+   * sender from indefinitely pausing a stream to hold unstreamed tokens
+   * hostage.
+   */
+  async forceCancel(streamId: bigint | string): Promise<string> {
+    this._ensureCanMutate();
+    return this._invoke(await this._resolveAddr(BigInt(streamId)), 'force_cancel', []);
+  }
+
+  /**
+   * Transfer the recipient role to a new address (current recipient only).
+   * The new recipient inherits all rights, including the withdrawable
+   * balance accrued up to the moment of transfer.
+   */
+  async transferRecipient(streamId: bigint | string, newRecipient: string): Promise<string> {
+    this._ensureCanMutate();
+    if (!newRecipient || typeof newRecipient !== 'string' || !newRecipient.trim()) {
+      throw new Error('Invalid recipient address: must be a non-empty string');
+    }
+    return this._invoke(await this._resolveAddr(BigInt(streamId)), 'transfer_recipient', [
+      new Address(newRecipient).toScVal(),
+    ]);
   }
 
   /**
@@ -490,12 +549,20 @@ export class StreamsModule {
   }
 
   /**
-   * List streams by sender or recipient with pagination metadata.
+   * List streams by sender and/or recipient with pagination metadata.
+   * When both `sender` and `recipient` are given, the result is the union
+   * of the two filters (streams where the address is either sender or
+   * recipient), de-duplicated — neither filter is silently dropped.
    * Returns a page of StreamInfo along with pagination metadata so the
    * frontend can implement infinite scrolling.
    */
   async list(params: ListStreamsParams): Promise<PaginatedStreams> {
-    const { sender, recipient, limit = 20 } = params;
+    const { sender, recipient } = params;
+    // Clamp here (not just in FactoryModule) so hasNextPage/nextCursor math
+    // below stays consistent with the limit actually sent to the contract —
+    // otherwise a caller-supplied limit above the max would silently break
+    // pagination even though the contract call itself was clamped (see #489).
+    const limit = clampListLimit(params.limit ?? DEFAULT_LIST_LIMIT);
     let offset = params.offset ?? 0;
 
     // A cursor from a previous page's nextCursor takes precedence over a
@@ -520,7 +587,10 @@ export class StreamsModule {
 
     let ids: bigint[] = [];
 
-    const pageFromFilteredIds = async (filteredIds: bigint[]): Promise<PaginatedStreams> => {
+    const pageFromFilteredIds = async (
+      filteredIds: bigint[],
+      hasNextPageOverride?: boolean,
+    ): Promise<PaginatedStreams> => {
       ids = filteredIds;
       // Pre-warm the address cache for all IDs in this page concurrently,
       // then fetch stream info in parallel. Without this, each this.get(id)
@@ -529,7 +599,7 @@ export class StreamsModule {
       // single parallel fan-out before the info simulations begin.
       await Promise.all(ids.map(id => this._resolveAddr(id)));
       const streams = await Promise.all(ids.map(id => this.get(id)));
-      const hasNextPage = ids.length === limit;
+      const hasNextPage = hasNextPageOverride ?? ids.length === limit;
       const totalCount = BigInt(offset + ids.length);
       return {
         streams,
@@ -543,9 +613,30 @@ export class StreamsModule {
 
     // Sender/recipient contract queries already return the filtered page.
     // There is no scoped count method, so do not mix in global stream_count().
+    if (sender && recipient) {
+      // When both filters are given, merge the sender- and recipient-filtered
+      // streams into one ordered, de-duplicated list *before* paging it,
+      // rather than unioning two independently-paged sub-pages — the union
+      // of two limit-sized pages can be up to 2x the requested page size,
+      // and its length has no honest relationship to hasNextPage/nextCursor
+      // (see #507). There's no merged server-side index, so this re-fetches
+      // everything from offset 0 up through offset+limit on both
+      // sub-indices on every call — cost grows with offset, but the result
+      // is a correct page rather than a fast wrong one.
+      const window = clampListLimit(offset + limit + 1);
+      const [senderIds, recipientIds] = await Promise.all([
+        this._factory.streamsBySender(sender, 0, window),
+        this._factory.streamsByRecipient(recipient, 0, window),
+      ]);
+      const merged = [...new Set([...senderIds, ...recipientIds])]
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      const hasNextPage = merged.length > offset + limit;
+      return pageFromFilteredIds(merged.slice(offset, offset + limit), hasNextPage);
+    }
     if (sender) {
       return pageFromFilteredIds(await this._factory.streamsBySender(sender, offset, limit));
-    } else if (recipient) {
+    }
+    if (recipient) {
       return pageFromFilteredIds(await this._factory.streamsByRecipient(recipient, offset, limit));
     }
 
